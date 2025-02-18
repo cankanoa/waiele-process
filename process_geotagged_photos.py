@@ -8,8 +8,8 @@ from exif import Image as ExifImage  # pip install exif
 
 def dms_to_dd(dms_tuple, ref):
     """
-Convert (degrees, minutes, seconds) + reference (e.g., 'N'/'S' or 'E'/'W')
-into decimal degrees.
+    Convert (degrees, minutes, seconds) + reference (e.g., 'N'/'S' or 'E'/'W')
+    into decimal degrees.
     """
     degrees, minutes, seconds = dms_tuple
     dd = degrees + minutes / 60.0 + seconds / 3600.0
@@ -19,9 +19,9 @@ into decimal degrees.
 
 def parse_image_description(description):
     """
-Given a string like "key1-value1;key2-value2", parse and return a dict:
-{ "key1": "value1", "key2": "value2" }
-Ignores any empty or badly formed segments.
+    Given a string like "key1-value1;key2-value2", parse and return a dict:
+    { "key1": "value1", "key2": "value2" }
+    Ignores any empty or badly formed segments.
     """
     meta_dict = {}
     if not description:
@@ -40,25 +40,39 @@ Ignores any empty or badly formed segments.
             meta_dict[key] = value
     return meta_dict
 
-def import_geotagged_photos_to_points(folder_path, output_folder_path):
+def import_geotagged_photos_to_points(
+        input_folder_path,
+        output_folder_path,
+        folder_key_word,
+        folder_valid_values=None  # New optional parameter.
+):
     """
-1) Gathers geotagged photos from folder_path.
-2) Parses 'image_description' for the key 'folder'.
-3) Groups photos by 'folder' value.
-4) For each group (unique 'folder'):
-- Creates a subdirectory: /root_output_folder/folder_value
-- GPKG path: /root_output_folder/folder_value/folder_value.gpkg
+1) Gathers geotagged photos from input_folder_path.
+2) Uses 'folder_key_word' (case-insensitive) to find the grouping key in
+image_description, forcing the final column name to lowercase.
+3) Groups photos by that key's value.
+4) For each group:
+- Creates a subdirectory: /root_output_folder/<group_value>
+- GPKG path: /root_output_folder/<group_value>/<group_value>.gpkg
 * If GPKG doesn't exist, create columns for any new metadata keys.
-* If GPKG exists, raise error if new metadata keys aren't in the file.
-- Update/append points by filename.
-- Save GPKG.
-    """
-    # 1. Collect photo data
-    jpg_files = glob.glob(os.path.join(folder_path, '*.JPG')) \
-        + glob.glob(os.path.join(folder_path, '*.jpg'))
+* If GPKG exists, rename 'F' => 'f' if needed, raise an error if new keys aren't in the file.
+- Update/append points by matching 'filename'.
+- Remove old records whose filename is not in the new set.
+- Save the GPKG, avoiding the duplicate column name error.
+
+:param folder_valid_values: Optional list of allowed values for the folder grouping.
+If provided, only images with a group value in this list are processed.
+"""
+
+    # Always use a lowercase version for the final column name
+    final_key = folder_key_word.lower()
+
+    # 1. Gather all JPG files
+    jpg_files = glob.glob(os.path.join(input_folder_path, '*.JPG')) \
+        + glob.glob(os.path.join(input_folder_path, '*.jpg'))
 
     if not jpg_files:
-        print("No JPG files found in", folder_path)
+        print(f"No JPG files found in {input_folder_path}")
         return
 
     all_records = []
@@ -76,19 +90,27 @@ def import_geotagged_photos_to_points(folder_path, output_folder_path):
             if isinstance(alt, tuple) and len(alt) == 2:  # ratio
                 alt = alt[0] / alt[1]
 
-            # Parse the image_description into a dictionary
+            # Parse the image_description and normalize keys to lowercase
             image_description = getattr(img, 'image_description', None)
-            desc_dict = parse_image_description(image_description)
+            desc_dict = {k.lower(): v for k, v in parse_image_description(image_description).items()}
 
-            # We want a 'folder' key in the metadata. If missing, handle as needed.
-            if 'folder' not in desc_dict:
+            # Check if final_key exists
+            if final_key not in desc_dict:
                 print(
-                    f"Warning: 'folder' key not found in description for {photo_path}. "
-                    "Skipping this photo (or raise an error instead)."
+                    f"Warning: '{folder_key_word}' key (any case) not found "
+                    f"in description for {photo_path}. Skipping."
                 )
                 continue
 
-            folder_value = desc_dict['folder']
+            group_value = desc_dict[final_key]
+
+            # --- New Check ---
+            # If folder_valid_values is provided, check if the group_value is allowed.
+            if folder_valid_values is not None and group_value not in folder_valid_values:
+                raise ValueError(
+                    f"Invalid folder value '{group_value}' for photo '{photo_path}'. "
+                    f"Allowed values are: {folder_valid_values}"
+                )
 
             record = {
                 'filename': os.path.basename(photo_path),
@@ -100,72 +122,95 @@ def import_geotagged_photos_to_points(folder_path, output_folder_path):
                 'orientation': getattr(img, 'orientation', None),
                 # 3D geometry if altitude present
                 'geometry': Point(lon, lat, alt) if alt is not None else Point(lon, lat),
-                'folder': folder_value,  # keep folder if desired
-                'parsed_dict': desc_dict  # store all parsed keys for later
+                # Force the grouping column to final_key (lowercase)
+                final_key: group_value,
+                'parsed_dict': desc_dict,
             }
             all_records.append(record)
         else:
             print(f"Skipping {photo_path}: No valid GPS EXIF found.")
 
     if not all_records:
-        print("No valid geotagged photos found with folder metadata.")
+        print(f"No valid geotagged photos found with '{folder_key_word}' metadata.")
         return
 
-    # 2. Group records by folder
+    # 2. Group records by the final_key
     grouped_records = defaultdict(list)
     for record in all_records:
-        grouped_records[record['folder']].append(record)
+        grouped_records[record[final_key]].append(record)
 
-    # 3. For each folder group, create/update a GPKG
-    for folder_value, records in grouped_records.items():
-        # Create subdirectory: /root_output_folder/<folder_value>
-        folder_output_dir = os.path.join(output_folder_path, folder_value)
+    # 3. For each group, create/update a GPKG
+    for group_value, records in grouped_records.items():
+        # Subdirectory
+        folder_output_dir = os.path.join(output_folder_path, group_value)
         os.makedirs(folder_output_dir, exist_ok=True)
 
-        # GPKG path: /root_output_folder/<folder_value>/<folder_value>.gpkg
-        gpkg_path = os.path.join(folder_output_dir, f"{folder_value}.gpkg")
+        # Output GPKG path
+        gpkg_path = os.path.join(folder_output_dir, f"{group_value}.gpkg")
 
-        # Gather distinct metadata keys
+        # Gather distinct metadata keys from these records
         all_meta_keys = set()
         for rec in records:
             all_meta_keys.update(rec['parsed_dict'].keys())
 
-        # Try reading an existing GPKG
+        # Attempt to read existing GPKG
         if os.path.exists(gpkg_path):
             try:
                 existing_gdf = gpd.read_file(gpkg_path)
-                existing_columns = set(existing_gdf.columns)
+                existing_columns = list(existing_gdf.columns)
             except Exception as e:
                 print(f"Warning: Could not read existing file '{gpkg_path}': {e}")
                 existing_gdf = None
-                existing_columns = None
+                existing_columns = []
         else:
             existing_gdf = None
-            existing_columns = None
+            existing_columns = []
 
-        # If a GPKG exists, ensure new metadata keys are already in columns
-        if existing_columns is not None:
+        # --- NEW STEP: If the existing GPKG has a column "F" that conflicts with "f", rename it. ---
+        # Because GeoPackage is case-insensitive, "F" and "f" collide. We'll unify them to final_key.
+        renamed_cols = {}
+        # We'll check for any columns that match final_key case-insensitively
+        for col in existing_columns:
+            if col.lower() == final_key and col != final_key:
+                # e.g., col = "F", final_key = "f"
+                # If there's already a "f" column, unify them
+                if final_key in existing_columns:
+                    # unify data if needed
+                    existing_gdf[final_key] = existing_gdf[final_key].fillna(existing_gdf[col])
+                    # drop the old column
+                    existing_gdf.drop(columns=[col], inplace=True)
+                else:
+                    renamed_cols[col] = final_key
+
+        if renamed_cols:
+            existing_gdf.rename(columns=renamed_cols, inplace=True)
+            # update columns list
+            existing_columns = list(existing_gdf.columns)
+
+        # If GPKG still exists, ensure new metadata keys are already in columns
+        if existing_gdf is not None and not existing_gdf.empty:
             for k in all_meta_keys:
-                if k not in existing_columns and k not in ('folder', 'parsed_dict'):
-                    raise ValueError(
-                        f"Image metadata key '{k}' does not match a point field in "
-                        f"'{gpkg_path}'. Correct the key in the image or "
-                        f"create a new field named '{k}' in this GPKG."
-                    )
+                if k not in (final_key, 'parsed_dict', 'image_description'):
+                    # Because it's case-insensitive, compare lower
+                    col_lowers = [c.lower() for c in existing_columns]
+                    if k.lower() not in col_lowers:
+                        raise ValueError(
+                            f"Image metadata key '{k}' does not match a point field in "
+                            f"'{gpkg_path}'. Correct the key in the image or "
+                            f"create a new field named '{k}' in this GPKG."
+                        )
 
-        # Build new_gdf
+        # Build new_gdf from the records
         new_gdf = gpd.GeoDataFrame(records, crs="EPSG:4326")
 
-        # If no existing data => create new columns for each metadata key
+        # If no existing data => create new columns
         if existing_gdf is None or existing_gdf.empty:
-            # 1) Make sure these columns exist in new_gdf
             for meta_key in all_meta_keys:
-                if meta_key not in ('folder', 'parsed_dict', 'image_description'):
-                    # If it's not already present, create it
+                if meta_key not in (final_key, 'parsed_dict', 'image_description'):
                     if meta_key not in new_gdf.columns:
                         new_gdf[meta_key] = None
 
-            # 2) Populate those columns with the metadata values
+            # Populate
             for i, row in new_gdf.iterrows():
                 desc_dict = row['parsed_dict']
                 for k, v in desc_dict.items():
@@ -173,24 +218,26 @@ def import_geotagged_photos_to_points(folder_path, output_folder_path):
                         new_gdf.loc[i, k] = v
         else:
             # If GPKG exists, only update columns that are known
+            existing_lower_map = {c.lower(): c for c in existing_columns}
             for i, row in new_gdf.iterrows():
                 desc_dict = row['parsed_dict']
                 for k, v in desc_dict.items():
-                    if k in existing_columns:
-                        new_gdf.loc[i, k] = v
+                    kl = k.lower()
+                    if kl in existing_lower_map:
+                        actual_col = existing_lower_map[kl]
+                        new_gdf.loc[i, actual_col] = v
 
-        # Remove 'parsed_dict' if not needed
+        # Remove 'parsed_dict' column if not needed
         if 'parsed_dict' in new_gdf.columns:
             new_gdf.drop(columns=['parsed_dict'], inplace=True)
 
         # Merge or create fresh
         if existing_gdf is not None and not existing_gdf.empty:
-            # Combine columns
-            all_cols = list(set(existing_gdf.columns).union(set(new_gdf.columns)))
+            all_cols = list(set(existing_gdf.columns) | set(new_gdf.columns))
             existing_gdf = existing_gdf.reindex(columns=all_cols)
             new_gdf = new_gdf.reindex(columns=all_cols)
 
-            # Update or append rows by matching 'filename'
+            # Update or append by matching 'filename'
             for i, new_row in new_gdf.iterrows():
                 match = existing_gdf['filename'] == new_row['filename']
                 if match.any():
@@ -199,8 +246,13 @@ def import_geotagged_photos_to_points(folder_path, output_folder_path):
                         if col != 'filename':
                             existing_gdf.loc[idx, col] = new_row[col]
                 else:
-                    existing_gdf = pd.concat([existing_gdf, new_row.to_frame().T],
-                                             ignore_index=True)
+                    existing_gdf = pd.concat(
+                        [existing_gdf, new_row.to_frame().T], ignore_index=True
+                    )
+
+            # Remove old records not present in new_gdf
+            new_filenames = set(new_gdf['filename'])
+            existing_gdf = existing_gdf[existing_gdf['filename'].isin(new_filenames)]
 
             final_gdf = existing_gdf
         else:
@@ -211,8 +263,18 @@ def import_geotagged_photos_to_points(folder_path, output_folder_path):
         final_gdf.to_file(gpkg_path, driver='GPKG')
         print(f"Saved {len(final_gdf)} records to '{gpkg_path}'.")
 
+
 # Example usage:
 if __name__ == "__main__":
-    input_folder_path = '/Users/kanoalindiwe/Downloads/waiele/Final/GeotaggedPhotos'
-    output_folder_path = "/Users/kanoalindiwe/Downloads/waiele/Final/"
-    import_geotagged_photos_to_points(input_folder_path, output_folder_path)
+    input_folder_path = '/Users/kanoalindiwe/Downloads/waiele/waiele_project/geotagged_photos'
+    output_folder_path = "/Users/kanoalindiwe/Downloads/waiele/waiele_project"
+    folder_key_word = 'F' # or lower/upper case
+    # folder_valid_values = "None" for no filter or ['plansi', 'otherallowedvalue'] for filtering
+    folder_valid_values = ['plantss', 'plantsi', 'fauna', 'arch', 'debris']
+
+    import_geotagged_photos_to_points(
+        input_folder_path,
+        output_folder_path,
+        folder_key_word,
+        folder_valid_values
+    )
